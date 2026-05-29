@@ -5,10 +5,12 @@ namespace {
 
 constexpr int PIN_TX2 = 17;
 constexpr int PIN_RX2 = 16;
-// Manchester a 300 baud => 1 bit = 3.33 ms, medio bit = 1.66 ms
-// Bit 0 = LOW->HIGH (subida luz)   Bit 1 = HIGH->LOW (bajada luz)
-constexpr unsigned long BIT_HALF_US = 1666;
-constexpr unsigned long TX_PERIOD_MS = 7000;
+// Manchester a 20 bps => 1 bit = 50 ms, medio bit = 25 ms
+// LDR lento: se usa delay() en lugar de delayMicroseconds() para mayor precision
+constexpr unsigned long BIT_HALF_MS = 25;    // ms por semiciclo
+// Trama tipica ~157 bytes = 1256 bits => ~63 s de transmision
+// TX_PERIOD_MS debe ser mayor que ese tiempo para no solapar tramas
+constexpr unsigned long TX_PERIOD_MS = 90000;   // 90 segundos
 
 // Bytes de sincronizacion
 constexpr uint8_t PREAMBLE_BYTE = 0x55;   // 01010101 = onda cuadrada en Manchester
@@ -92,14 +94,14 @@ void IRAM_ATTR manchesterSendByte(uint8_t b) {
     const bool bit = (b >> i) & 0x01;
     if (bit) {
       digitalWrite(PIN_TX2, HIGH);
-      delayMicroseconds(BIT_HALF_US);
+      delay(BIT_HALF_MS);
       digitalWrite(PIN_TX2, LOW);
-      delayMicroseconds(BIT_HALF_US);
+      delay(BIT_HALF_MS);
     } else {
       digitalWrite(PIN_TX2, LOW);
-      delayMicroseconds(BIT_HALF_US);
+      delay(BIT_HALF_MS);
       digitalWrite(PIN_TX2, HIGH);
-      delayMicroseconds(BIT_HALF_US);
+      delay(BIT_HALF_MS);
     }
   }
 }
@@ -147,8 +149,8 @@ void setup() {
   pinMode(PIN_TX2, OUTPUT);
   digitalWrite(PIN_TX2, LOW);   // estado idle: laser apagado
 
-  Serial.printf("[TX] Manchester GPIO%d  bit=%luus  half=%luus\n",
-                PIN_TX2, BIT_HALF_US * 2, BIT_HALF_US);
+  Serial.printf("[TX] Manchester GPIO%d  bit=%lums  half=%lums\n",
+                PIN_TX2, BIT_HALF_MS * 2, BIT_HALF_MS);
 
   // Timer 0: dispara cada TX_PERIOD_MS exactos, independiente del loop()
   txTimer = timerBegin(0, 80, true);                               // 1 tick = 1 us

@@ -7,8 +7,8 @@ namespace {
 
 constexpr int PIN_TX2 = 17;       // (sin uso, libre)
 constexpr int PIN_RX_DATA = 16;   // entrada digital del receptor (LDR via NPN)
-// Manchester 300 baud: medio bit = 1.66 ms; sampleamos cada 1.66 ms (Nyquist 2x)
-constexpr unsigned long HALF_BIT_US = 1666;
+// Manchester 20 bps: T = 50ms, T/2 = 25ms
+// Decodificacion por flancos: corto(<37ms)=frontera, largo(>=37ms)=centro
 
 // Trama: [PREAMBLE 4x0x55][SYNC 0x7E][LEN 2B BE][PAYLOAD N B]
 constexpr uint8_t  SYNC_BYTE     = 0x7E;
@@ -23,8 +23,8 @@ constexpr int PIN_ADC_LDR = 34;
 constexpr int PIN_LED_R = 25;
 constexpr int PIN_LED_G = 26;
 constexpr int PIN_LED_B = 27;
-// Si no hay trama ok en 20 s (>= 3 periodos TX) se considera enlace perdido
-constexpr unsigned long LINK_TIMEOUT_MS = 20000;
+// Si no hay trama ok en 200 s (~3 frames a 20bps) se considera enlace perdido
+constexpr unsigned long LINK_TIMEOUT_MS = 200000;
 
 constexpr const char *AP_SSID = "FSO-RX";
 constexpr const char *AP_PASS = "fso12345";
@@ -32,10 +32,13 @@ const IPAddress AP_IP(192, 168, 4, 1);
 const IPAddress AP_GW(192, 168, 4, 1);
 const IPAddress AP_MASK(255, 255, 255, 0);
 
-// Timer de hardware para muestrear GPIO16 cada half-bit (1.66ms)
-// Decodificador Manchester con maquina de estados en la ISR
-hw_timer_t *sampleTimer = nullptr;
+// Decoder Manchester por detección de flancos (edge-triggered, auto-sincronizante)
+// T/2 = 50ms = 50000µs  T = 100ms
+// Flanco corto (<75000µs): transición de frontera de bit  -> no genera bit
+// Flanco largo (>=75000µs): transición del CENTRO del bit -> bit determinado por dirección
 portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
+constexpr unsigned long MAN_SHORT_US  = 37500;   // umbral corto vs largo (75% de T=50ms)
+constexpr unsigned long MAN_TIMEOUT_US = 300000; // >300ms = resincronizar (>6 bits silencio a 20bps)
 
 enum RxState : uint8_t {
   ST_SEARCH_PREAMBLE,
@@ -53,9 +56,8 @@ uint8_t  rxBuffer[MAX_PAYLOAD];
 volatile bool framePending = false;
 volatile uint16_t framePendingLen = 0;
 
-// Estado del decodificador Manchester (dos samples = 1 bit)
-volatile uint8_t lastSample = 0;
-volatile bool    haveLast = false;
+volatile unsigned long manchLastEdgeUs = 0;
+volatile bool manchLastWasShort = false;
 
 WebServer server(80);
 
@@ -222,7 +224,7 @@ inline void IRAM_ATTR rxPushBit(uint8_t bit) {
       else {
         rxLen |= b;
         if (rxLen == 0 || rxLen > MAX_PAYLOAD) {
-          rxState = ST_SEARCH_PREAMBLE; haveLast = false;
+          rxState = ST_SEARCH_PREAMBLE;
         } else {
           rxState = ST_READ_PAYLOAD;
           rxIdx = 0;
@@ -235,35 +237,44 @@ inline void IRAM_ATTR rxPushBit(uint8_t bit) {
         framePendingLen = rxLen;
         framePending = true;
         rxState = ST_SEARCH_PREAMBLE;
-        haveLast = false;
       }
       break;
     default: break;
   }
 }
 
-// ISR: ejecutada cada HALF_BIT_US. Toma una muestra y decodifica Manchester.
-void IRAM_ATTR onSampleTimer() {
+// ISR: se activa en cada flanco (CHANGE) del GPIO16.
+// Clasifica el flanco como CORTO (frontera de bit) o LARGO (centro = dato).
+// IEEE 802.3: flanco de subida en el centro = bit 0, flanco de bajada = bit 1.
+void IRAM_ATTR onEdge() {
+  const unsigned long now = micros();
+  const unsigned long dt  = now - manchLastEdgeUs;
+  manchLastEdgeUs = now;
+
+  // nivel actual POST-flanco: HIGH significa flanco de subida = bit 0
+  const uint8_t bit = digitalRead(PIN_RX_DATA) ? 0 : 1;
+
   portENTER_CRITICAL_ISR(&rxMux);
-  uint8_t s = (digitalRead(PIN_RX_DATA) ? 1 : 0);
-  if (!haveLast) {
-    lastSample = s;
-    haveLast = true;
+
+  if (dt > MAN_TIMEOUT_US) {
+    // Silencio prolongado: resincronizar. Este flanco es el centro del 1er bit.
+    rxState = ST_SEARCH_PREAMBLE;
+    rxByte = 0; rxBitCount = 0; rxIdx = 0;
+    manchLastWasShort = false;
+    rxPushBit(bit);
+  } else if (manchLastWasShort) {
+    // Anterior fue frontera -> este flanco ES el centro del bit
+    rxPushBit(bit);
+    manchLastWasShort = false;
+  } else if (dt < MAN_SHORT_US) {
+    // Flanco corto: es frontera de bit, no genera dato
+    manchLastWasShort = true;
   } else {
-    if (lastSample == 0 && s == 1) {
-      // transicion LOW->HIGH en el centro del bit = bit 0
-      rxPushBit(0);
-      haveLast = false;
-    } else if (lastSample == 1 && s == 0) {
-      // transicion HIGH->LOW = bit 1
-      rxPushBit(1);
-      haveLast = false;
-    } else {
-      // 00 o 11 -> no hubo transicion: estamos desfasados.
-      // Descartamos la muestra previa y conservamos la actual para re-alinear.
-      lastSample = s;
-    }
+    // Flanco largo: centro del bit sin frontera previa
+    rxPushBit(bit);
+    manchLastWasShort = false;
   }
+
   portEXIT_CRITICAL_ISR(&rxMux);
 }
 
@@ -387,8 +398,8 @@ void setup() {
   setLed(true, false, false);   // rojo hasta recibir primer dato
 
   pinMode(PIN_RX_DATA, INPUT);
-  Serial.printf("[RX] Manchester GPIO%d half=%luus bit=%luus\n",
-                PIN_RX_DATA, HALF_BIT_US, HALF_BIT_US * 2);
+  Serial.printf("[RX] Manchester GPIO%d edge-triggered (umbral=%lums timeout=%lums)\n",
+                PIN_RX_DATA, MAN_SHORT_US/1000, MAN_TIMEOUT_US/1000);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
@@ -403,12 +414,10 @@ void setup() {
 
   Serial.println("[RX] Dashboard en http://192.168.4.1/");
 
-  // Timer 1 (sampling): cada HALF_BIT_US toma muestra y decodifica Manchester
-  sampleTimer = timerBegin(1, 80, true);   // 1 tick = 1us
-  timerAttachInterrupt(sampleTimer, &onSampleTimer, true);
-  timerAlarmWrite(sampleTimer, HALF_BIT_US, true);
-  timerAlarmEnable(sampleTimer);
-  Serial.printf("[RX] Sampler Manchester @ %luus activo\n", HALF_BIT_US);
+  // Interrupt por flanco: auto-sincronizante, sin deriva de timer
+  manchLastEdgeUs = micros();
+  attachInterrupt(digitalPinToInterrupt(PIN_RX_DATA), onEdge, CHANGE);
+  Serial.println("[RX] Edge decoder Manchester activo (IRQ CHANGE GPIO16)");
 }
 
 void loop() {
