@@ -5,21 +5,25 @@ namespace {
 
 constexpr int PIN_TX2 = 17;
 constexpr int PIN_RX2 = 16;
+// Pin donde conectaremos el pulsador (el otro extremo a GND)
+constexpr int PIN_BUTTON = 4;
+
 // Manchester a 20 bps => 1 bit = 50 ms, medio bit = 25 ms
-// LDR lento: se usa delay() en lugar de delayMicroseconds() para mayor precision
-constexpr unsigned long BIT_HALF_MS = 25;    // ms por semiciclo
-// Trama tipica ~157 bytes = 1256 bits => ~63 s de transmision
-// TX_PERIOD_MS debe ser mayor que ese tiempo para no solapar tramas
+constexpr unsigned long BIT_HALF_MS = 25;    
 constexpr unsigned long TX_PERIOD_MS = 90000;   // 90 segundos
 
-// Bytes de sincronizacion
-constexpr uint8_t PREAMBLE_BYTE = 0x55;   // 01010101 = onda cuadrada en Manchester
+constexpr uint8_t PREAMBLE_BYTE = 0x55;   
 constexpr uint8_t PREAMBLE_LEN  = 4;
 constexpr uint8_t SYNC_BYTE     = 0x7E;
 
-// Timer de hardware para el periodo de transmision
 hw_timer_t *txTimer = nullptr;
 volatile bool txPending = false;
+
+// Variables para el Modo Apuntado y Anti-rebote
+bool targetingMode = false;
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+constexpr unsigned long DEBOUNCE_DELAY = 50; // 50ms para evitar rebotes físicos
 
 void IRAM_ATTR onTxTimer() {
   txPending = true;
@@ -85,10 +89,6 @@ void buildMockPayload(JsonDocument &doc) {
   doc["p_w"] = roundf(pw * 100.0f) / 100.0f;
 }
 
-// --- Manchester bit-banging --------------------------------------------
-// Bit 0 = LOW->HIGH (encender laser en el centro del bit)
-// Bit 1 = HIGH->LOW (apagar laser en el centro del bit)
-// IEEE 802.3 convention
 void IRAM_ATTR manchesterSendByte(uint8_t b) {
   for (int i = 7; i >= 0; --i) {
     const bool bit = (b >> i) & 0x01;
@@ -107,16 +107,11 @@ void IRAM_ATTR manchesterSendByte(uint8_t b) {
 }
 
 void manchesterSendFrame(const uint8_t *data, uint16_t len) {
-  // Preambulo: secuencia 0x55 = onda cuadrada perfecta para sincronizar el RX
   for (uint8_t i = 0; i < PREAMBLE_LEN; ++i) manchesterSendByte(PREAMBLE_BYTE);
-  // Sync: rompe el patron y marca inicio de datos
   manchesterSendByte(SYNC_BYTE);
-  // Longitud big-endian
   manchesterSendByte((len >> 8) & 0xFF);
   manchesterSendByte(len & 0xFF);
-  // Payload
   for (uint16_t i = 0; i < len; ++i) manchesterSendByte(data[i]);
-  // Idle final: laser apagado
   digitalWrite(PIN_TX2, LOW);
 }
 
@@ -128,7 +123,7 @@ void sendFrame() {
   serializeJson(doc, payload);
 
   const uint32_t crc = crc32_calc(reinterpret_cast<const uint8_t *>(payload.c_str()), payload.length());
-  String frame = payload + "|" + String(crc);    // SIN '\n', usamos LEN explicito
+  String frame = payload + "|" + String(crc);    
 
   manchesterSendFrame(reinterpret_cast<const uint8_t *>(frame.c_str()), frame.length());
 
@@ -145,15 +140,17 @@ void setup() {
 
   randomSeed(esp_random());
 
-  // Bit-banging Manchester por GPIO17 (sin UART)
   pinMode(PIN_TX2, OUTPUT);
-  digitalWrite(PIN_TX2, LOW);   // estado idle: laser apagado
+  digitalWrite(PIN_TX2, LOW);   // apagado por defecto
+
+  // Configuramos el pin del botón con resistencia pull-up interna
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
 
   Serial.printf("[TX] Manchester GPIO%d  bit=%lums  half=%lums\n",
                 PIN_TX2, BIT_HALF_MS * 2, BIT_HALF_MS);
 
-  // Timer 0: dispara cada TX_PERIOD_MS exactos, independiente del loop()
-  txTimer = timerBegin(0, 80, true);                               // 1 tick = 1 us
+  // Timer 0 configurado
+  txTimer = timerBegin(0, 80, true);                               
   timerAttachInterrupt(txTimer, &onTxTimer, true);
   timerAlarmWrite(txTimer, (uint64_t)TX_PERIOD_MS * 1000ULL, true);
   timerAlarmEnable(txTimer);
@@ -161,8 +158,52 @@ void setup() {
 }
 
 void loop() {
-  if (txPending) {
-    txPending = false;
-    sendFrame();
+  // 1. LECTURA DEL BOTÓN CON ANTI-REBOTE
+  int reading = digitalRead(PIN_BUTTON);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    static int buttonState = HIGH;
+    if (reading != buttonState) {
+      buttonState = reading;
+      
+      // Si el botón fue presionado (pasa de HIGH a LOW)
+      if (buttonState == LOW) {
+        targetingMode = !targetingMode; // Cambiamos de modo
+        
+        if (targetingMode) {
+          Serial.println("\n[TX] >>> MODO APUNTADO ACTIVADO <<< (Laser FIJO)");
+          timerAlarmDisable(txTimer); // Pausamos el timer automático
+          digitalWrite(PIN_TX2, HIGH); // Encendemos el láser fijo
+        } else {
+          Serial.println("\n[TX] <<< MODO NORMAL ACTIVADO >>> (Transmision habilitada)");
+          digitalWrite(PIN_TX2, LOW); // Apagamos el láser
+          txPending = false;          // Limpiamos banderas pendientes
+          timerWrite(txTimer, 0);     // Reiniciamos el contador a 0
+          timerAlarmEnable(txTimer);  // Reactivamos el timer
+        }
+      }
+    }
+  }
+  lastButtonState = reading;
+
+  // 2. LÓGICA DE TRANSMISIÓN (Solo si NO estamos en modo apuntado)
+  if (!targetingMode) {
+    
+    // Disparo por timer de hardware (cada 90s)
+    if (txPending) {
+      txPending = false;
+      sendFrame();
+    }
+
+    // Disparo manual via Monitor Serie
+    if (Serial.available() > 0) {
+      Serial.readString(); // Limpiamos el buffer
+      Serial.println("[TX] *** Disparo manual forzado por Serie ***");
+      sendFrame();
+    }
+    
   }
 }

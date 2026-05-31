@@ -5,40 +5,32 @@
 
 namespace {
 
-constexpr int PIN_TX2 = 17;       // (sin uso, libre)
-constexpr int PIN_RX_DATA = 16;   // entrada digital del receptor (LDR via NPN)
-// Manchester 20 bps: T = 50ms, T/2 = 25ms
-// Decodificacion por flancos: corto(<37ms)=frontera, largo(>=37ms)=centro
+// Ya no usamos el PIN_RX_DATA digital
+constexpr int PIN_ADC_LDR = 34;
 
+// Umbrales de histéresis calibrados
+constexpr int THRESHOLD_HIGH = 3800;
+constexpr int THRESHOLD_LOW  = 3200;
+
+// Manchester 20 bps: T = 50ms, T/2 = 25ms
 // Trama: [PREAMBLE 4x0x55][SYNC 0x7E][LEN 2B BE][PAYLOAD N B]
 constexpr uint8_t  SYNC_BYTE     = 0x7E;
 constexpr uint16_t MAX_PAYLOAD   = 600;
 
-// GPIO34 = D34: lectura analogica del divisor LDR-10k (solo diagnostico)
-// Conectar punto medio del divisor directamente a D34
-constexpr int PIN_ADC_LDR = 34;
-
-// LED RGB (catodo comun): HIGH = encendido
-// Cambiar a LOW=encendido si tu modulo es de anodo comun
 constexpr int PIN_LED_R = 25;
 constexpr int PIN_LED_G = 26;
 constexpr int PIN_LED_B = 27;
-// Si no hay trama ok en 200 s (~3 frames a 20bps) se considera enlace perdido
 constexpr unsigned long LINK_TIMEOUT_MS = 200000;
 
-constexpr const char *AP_SSID = "FSO-RX";
+constexpr const char *AP_SSID = "FSO-RX"; 
 constexpr const char *AP_PASS = "fso12345";
 const IPAddress AP_IP(192, 168, 4, 1);
 const IPAddress AP_GW(192, 168, 4, 1);
 const IPAddress AP_MASK(255, 255, 255, 0);
 
-// Decoder Manchester por detección de flancos (edge-triggered, auto-sincronizante)
-// T/2 = 50ms = 50000µs  T = 100ms
-// Flanco corto (<75000µs): transición de frontera de bit  -> no genera bit
-// Flanco largo (>=75000µs): transición del CENTRO del bit -> bit determinado por dirección
 portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 constexpr unsigned long MAN_SHORT_US  = 37500;   // umbral corto vs largo (75% de T=50ms)
-constexpr unsigned long MAN_TIMEOUT_US = 300000; // >300ms = resincronizar (>6 bits silencio a 20bps)
+constexpr unsigned long MAN_TIMEOUT_US = 300000; // >300ms = resincronizar
 
 enum RxState : uint8_t {
   ST_SEARCH_PREAMBLE,
@@ -63,7 +55,7 @@ WebServer server(80);
 
 String lastPayload = "{}";
 unsigned long rxOk = 0;
-unsigned long lastRxOkMs = 0;   // timestamp del ultimo frame valido
+unsigned long lastRxOkMs = 0;
 unsigned long crcErr = 0;
 unsigned long frameErr = 0;
 unsigned long jsonErr = 0;
@@ -90,11 +82,11 @@ void setLed(bool r, bool g, bool b) {
 void updateLed() {
   const bool timeout = (rxOk == 0) || (millis() - lastRxOkMs > LINK_TIMEOUT_MS);
   if (timeout) {
-    setLed(true, false, false);   // ROJO: sin datos
+    setLed(true, false, false);
   } else if (lastQuality >= 70) {
-    setLed(false, true, false);   // VERDE: enlace bueno
+    setLed(false, true, false);
   } else {
-    setLed(true, true, false);    // AMARILLO: enlace debil
+    setLed(true, true, false);
   }
 }
 
@@ -180,7 +172,6 @@ void handleFrame(const String &line) {
 }
 
 void readUartFrames() {
-  // Si la ISR completó una trama, procesarla
   bool ready = false;
   uint16_t len = 0;
   portENTER_CRITICAL(&rxMux);
@@ -199,8 +190,7 @@ void readUartFrames() {
   handleFrame(line);
 }
 
-// Recibe 1 bit decodificado: lo acumula en byte y avanza maquina de estados
-inline void IRAM_ATTR rxPushBit(uint8_t bit) {
+inline void rxPushBit(uint8_t bit) {
   rxByte = (rxByte << 1) | (bit & 0x01);
   ++rxBitCount;
   if (rxBitCount < 8) return;
@@ -210,14 +200,11 @@ inline void IRAM_ATTR rxPushBit(uint8_t bit) {
 
   switch (rxState) {
     case ST_SEARCH_PREAMBLE:
-      // Esperamos el byte de sync DESPUES de cualquier secuencia de 0x55
       if (b == SYNC_BYTE) {
         rxState = ST_READ_LEN;
         rxIdx = 0;
         rxLen = 0;
       }
-      // bytes 0x55 (preambulo) los ignoramos; cualquier otro byte tambien
-      // (la ISR esta alineada al patron del preambulo via half-bit sampling)
       break;
     case ST_READ_LEN:
       if (rxIdx == 0) { rxLen = (uint16_t)b << 8; rxIdx = 1; }
@@ -243,39 +230,63 @@ inline void IRAM_ATTR rxPushBit(uint8_t bit) {
   }
 }
 
-// ISR: se activa en cada flanco (CHANGE) del GPIO16.
-// Clasifica el flanco como CORTO (frontera de bit) o LARGO (centro = dato).
-// IEEE 802.3: flanco de subida en el centro = bit 0, flanco de bajada = bit 1.
-void IRAM_ATTR onEdge() {
+// Esta funcion reemplaza a la antigua ISR. Es llamada por la tarea de escaneo
+// cuando detectamos por software que la señal cruzó los umbrales.
+void processEdge(bool isHigh) {
   const unsigned long now = micros();
   const unsigned long dt  = now - manchLastEdgeUs;
   manchLastEdgeUs = now;
 
   // nivel actual POST-flanco: HIGH significa flanco de subida = bit 0
-  const uint8_t bit = digitalRead(PIN_RX_DATA) ? 0 : 1;
+  const uint8_t bit = isHigh ? 0 : 1;
 
-  portENTER_CRITICAL_ISR(&rxMux);
+  portENTER_CRITICAL(&rxMux);
 
   if (dt > MAN_TIMEOUT_US) {
-    // Silencio prolongado: resincronizar. Este flanco es el centro del 1er bit.
     rxState = ST_SEARCH_PREAMBLE;
     rxByte = 0; rxBitCount = 0; rxIdx = 0;
     manchLastWasShort = false;
     rxPushBit(bit);
   } else if (manchLastWasShort) {
-    // Anterior fue frontera -> este flanco ES el centro del bit
     rxPushBit(bit);
     manchLastWasShort = false;
   } else if (dt < MAN_SHORT_US) {
-    // Flanco corto: es frontera de bit, no genera dato
     manchLastWasShort = true;
   } else {
-    // Flanco largo: centro del bit sin frontera previa
     rxPushBit(bit);
     manchLastWasShort = false;
   }
 
-  portEXIT_CRITICAL_ISR(&rxMux);
+  portEXIT_CRITICAL(&rxMux);
+}
+
+// =========================================================================
+// TAREA DE LECTURA DEL ADC (Se ejecuta en paralelo al loop)
+// =========================================================================
+void adcPollingTask(void *pvParameters) {
+  bool lastState = false; // Asumimos que arranca apagado
+  
+  while (true) {
+    int val = analogRead(PIN_ADC_LDR);
+    bool newState = lastState;
+
+    // Histéresis
+    if (val > THRESHOLD_HIGH) {
+      newState = true;
+    } else if (val < THRESHOLD_LOW) {
+      newState = false;
+    }
+
+    // Si hubo un cambio de estado, procesamos el flanco
+    if (newState != lastState) {
+      processEdge(newState);
+      lastState = newState;
+    }
+
+    // Pausa pequeñita para no bloquear el procesador (1 milisegundo)
+    // Es lo suficientemente rápido para no perder resolución en los 25ms de Manchester
+    vTaskDelay(pdMS_TO_TICKS(1)); 
+  }
 }
 
 String stateJson() {
@@ -386,7 +397,7 @@ void handleApiState() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("[RX] ESP32 FSO RX iniciado");
+  Serial.println("[RX] ESP32 FSO RX iniciado (Decodificador por ADC)");
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -395,11 +406,7 @@ void setup() {
   pinMode(PIN_LED_R, OUTPUT);
   pinMode(PIN_LED_G, OUTPUT);
   pinMode(PIN_LED_B, OUTPUT);
-  setLed(true, false, false);   // rojo hasta recibir primer dato
-
-  pinMode(PIN_RX_DATA, INPUT);
-  Serial.printf("[RX] Manchester GPIO%d edge-triggered (umbral=%lums timeout=%lums)\n",
-                PIN_RX_DATA, MAN_SHORT_US/1000, MAN_TIMEOUT_US/1000);
+  setLed(true, false, false);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
@@ -414,17 +421,25 @@ void setup() {
 
   Serial.println("[RX] Dashboard en http://192.168.4.1/");
 
-  // Interrupt por flanco: auto-sincronizante, sin deriva de timer
+  // Lanzamos la tarea dedicada de escaneo del ADC en el Core 1
   manchLastEdgeUs = micros();
-  attachInterrupt(digitalPinToInterrupt(PIN_RX_DATA), onEdge, CHANGE);
-  Serial.println("[RX] Edge decoder Manchester activo (IRQ CHANGE GPIO16)");
+  xTaskCreatePinnedToCore(
+    adcPollingTask,   // Funcion de la tarea
+    "ADC_Task",       // Nombre
+    4096,             // Tamaño de pila (stack)
+    NULL,             // Parametros
+    2,                // Prioridad (alta)
+    NULL,             // Handle
+    1                 // Anclada al Core 1
+  );
+  Serial.println("[RX] Tarea de digitalizacion y Manchester activa!");
 }
 
 void loop() {
-  // La ISR del sample-timer publica framePending cuando hay trama completa.
+  // El loop original se mantiene super limpio.
   readUartFrames();
   updateQuality();
-  updateLed();          // millis(), sin cambios
+  updateLed();          
   server.handleClient();
 
   static unsigned long tLog = 0;
@@ -432,7 +447,5 @@ void loop() {
     tLog = millis();
     Serial.printf("[RX][LINK] ok=%lu crc=%lu frame=%lu json=%lu gap=%lu q=%d%%\n",
                   rxOk, crcErr, frameErr, jsonErr, seqGap, lastQuality);
-    int ldrRaw = analogRead(PIN_ADC_LDR);
-    Serial.printf("[RX][LDR]  adc=%d/4095 (%d%%)\n", ldrRaw, map(ldrRaw, 0, 4095, 0, 100));
   }
 }
