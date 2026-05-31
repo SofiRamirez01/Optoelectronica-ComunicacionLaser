@@ -5,39 +5,50 @@
 
 namespace {
 
-// Ya no usamos el PIN_RX_DATA digital
 constexpr int PIN_ADC_LDR = 34;
+// Pin para el pulsador de Modo Direccionamiento en el RX
+constexpr int PIN_BUTTON = 14;
 
-// Umbrales de histéresis calibrados
 constexpr int THRESHOLD_HIGH = 3800;
 constexpr int THRESHOLD_LOW  = 3200;
 
-// Manchester 20 bps: T = 50ms, T/2 = 25ms
-// Trama: [PREAMBLE 4x0x55][SYNC 0x7E][LEN 2B BE][PAYLOAD N B]
 constexpr uint8_t  SYNC_BYTE     = 0x7E;
-constexpr uint16_t MAX_PAYLOAD   = 600;
+constexpr uint16_t MAX_PAYLOAD   = 100;
 
 constexpr int PIN_LED_R = 25;
 constexpr int PIN_LED_G = 26;
 constexpr int PIN_LED_B = 27;
-constexpr unsigned long LINK_TIMEOUT_MS = 200000;
+constexpr unsigned long LINK_TIMEOUT_MS = 45000; 
 
-constexpr const char *AP_SSID = "FSO-RX"; 
+constexpr const char *AP_SSID = "FSO-RX";
 constexpr const char *AP_PASS = "fso12345";
 const IPAddress AP_IP(192, 168, 4, 1);
 const IPAddress AP_GW(192, 168, 4, 1);
 const IPAddress AP_MASK(255, 255, 255, 0);
 
 portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
-constexpr unsigned long MAN_SHORT_US  = 37500;   // umbral corto vs largo (75% de T=50ms)
-constexpr unsigned long MAN_TIMEOUT_US = 300000; // >300ms = resincronizar
+constexpr unsigned long MAN_SHORT_US  = 37500;   
+constexpr unsigned long MAN_TIMEOUT_US = 300000; 
 
-enum RxState : uint8_t {
-  ST_SEARCH_PREAMBLE,
-  ST_READ_LEN,
-  ST_READ_PAYLOAD,
-  ST_COMPLETE
+#pragma pack(push, 1)
+struct TelemetryData {
+  uint32_t seq;
+  uint32_t ts;
+  uint16_t F0;
+  uint16_t F1;
+  uint16_t F2;
+  uint16_t F3;
+  int16_t errAz;
+  int16_t errEl;
+  uint8_t motAz;
+  uint8_t motEl;
+  float vdc;
+  float idc;
+  float pw;
 };
+#pragma pack(pop)
+
+enum RxState : uint8_t { ST_SEARCH_PREAMBLE, ST_READ_LEN, ST_READ_PAYLOAD };
 
 volatile RxState rxState = ST_SEARCH_PREAMBLE;
 volatile uint8_t  rxByte = 0;
@@ -51,27 +62,27 @@ volatile uint16_t framePendingLen = 0;
 volatile unsigned long manchLastEdgeUs = 0;
 volatile bool manchLastWasShort = false;
 
+// Variable compartida entre la tarea del ADC y el loop para saber si hay luz AHORA
+volatile bool laserDetected = false;
+
+// Variables para el botón del RX
+bool targetingModeRx = false;
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+constexpr unsigned long DEBOUNCE_DELAY = 50;
+
 WebServer server(80);
 
-String lastPayload = "{}";
 unsigned long rxOk = 0;
 unsigned long lastRxOkMs = 0;
 unsigned long crcErr = 0;
 unsigned long frameErr = 0;
-unsigned long jsonErr = 0;
 unsigned long seqGap = 0;
 long lastSeq = -1;
 int lastQuality = 0;
 
-struct LastData {
-  unsigned long seq = 0;
-  unsigned long ts = 0;
-  int F0 = 0, F1 = 0, F2 = 0, F3 = 0;
-  int errAz = 0, errEl = 0;
-  int motAz = 0, motEl = 0;
-  String estado = "--";
-  float vdc = 0.0f, idc = 0.0f, pw = 0.0f;
-} lastData;
+TelemetryData lastData = {0};
+String lastEstado = "--";
 
 void setLed(bool r, bool g, bool b) {
   digitalWrite(PIN_LED_R, r ? HIGH : LOW);
@@ -82,11 +93,11 @@ void setLed(bool r, bool g, bool b) {
 void updateLed() {
   const bool timeout = (rxOk == 0) || (millis() - lastRxOkMs > LINK_TIMEOUT_MS);
   if (timeout) {
-    setLed(true, false, false);
+    setLed(true, false, false); // Rojo
   } else if (lastQuality >= 70) {
-    setLed(false, true, false);
+    setLed(false, true, false); // Verde
   } else {
-    setLed(true, true, false);
+    setLed(true, true, false);  // Amarillo
   }
 }
 
@@ -103,72 +114,41 @@ uint32_t crc32_calc(const uint8_t *data, size_t len) {
 }
 
 void updateQuality() {
-  const unsigned long total = rxOk + crcErr + frameErr + jsonErr;
-  if (total == 0) {
-    lastQuality = 0;
-    return;
-  }
+  const unsigned long total = rxOk + crcErr + frameErr;
+  if (total == 0) { lastQuality = 0; return; }
   lastQuality = static_cast<int>((100UL * rxOk) / total);
 }
 
-void parsePayloadFields(const String &payload) {
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    ++jsonErr;
-    return;
-  }
-
-  const long seq = doc["seq"] | 0;
-  if (lastSeq >= 0 && seq > lastSeq + 1) {
-    seqGap += static_cast<unsigned long>(seq - lastSeq - 1);
-  }
-  lastSeq = seq;
-
-  lastData.seq = static_cast<unsigned long>(seq);
-  lastData.ts = doc["ts"] | 0;
-  lastData.F0 = doc["F0"] | 0;
-  lastData.F1 = doc["F1"] | 0;
-  lastData.F2 = doc["F2"] | 0;
-  lastData.F3 = doc["F3"] | 0;
-  lastData.errAz = doc["Err_Az"] | 0;
-  lastData.errEl = doc["Err_El"] | 0;
-  lastData.motAz = doc["Mot_Az"] | 0;
-  lastData.motEl = doc["Mot_El"] | 0;
-  lastData.estado = String(static_cast<const char *>(doc["Estado"] | "--"));
-  lastData.vdc = doc["v_dc"] | 0.0f;
-  lastData.idc = doc["i_dc"] | 0.0f;
-  lastData.pw = doc["p_w"] | 0.0f;
-
-  ++rxOk;
-  lastRxOkMs = millis();
-  lastPayload = payload;
-}
-
-void handleFrame(const String &line) {
-  const int sep = line.lastIndexOf('|');
-  if (sep <= 0 || sep >= static_cast<int>(line.length()) - 1) {
+void handleFrame(uint8_t *buffer, uint16_t len) {
+  uint16_t expectedLen = sizeof(TelemetryData) + sizeof(uint32_t);
+  
+  if (len != expectedLen) {
     ++frameErr;
     return;
   }
 
-  const String payload = line.substring(0, sep);
-  const String crcStr = line.substring(sep + 1);
+  uint32_t rxCrc;
+  memcpy(&rxCrc, buffer + sizeof(TelemetryData), sizeof(uint32_t));
 
-  char *endp = nullptr;
-  const uint32_t rxCrc = strtoul(crcStr.c_str(), &endp, 10);
-  if (endp == crcStr.c_str() || *endp != '\0') {
-    ++frameErr;
-    return;
-  }
-
-  const uint32_t calc = crc32_calc(reinterpret_cast<const uint8_t *>(payload.c_str()), payload.length());
+  uint32_t calc = crc32_calc(buffer, sizeof(TelemetryData));
   if (calc != rxCrc) {
     ++crcErr;
     return;
   }
 
-  parsePayloadFields(payload);
+  TelemetryData payload;
+  memcpy(&payload, buffer, sizeof(TelemetryData));
+
+  if (lastSeq >= 0 && payload.seq > (uint32_t)(lastSeq + 1)) {
+    seqGap += (payload.seq - lastSeq - 1);
+  }
+  lastSeq = payload.seq;
+
+  lastData = payload;
+  lastEstado = (payload.motAz || payload.motEl) ? "BUSCANDO" : "TRACK";
+
+  ++rxOk;
+  lastRxOkMs = millis();
 }
 
 void readUartFrames() {
@@ -182,12 +162,9 @@ void readUartFrames() {
   }
   portEXIT_CRITICAL(&rxMux);
 
-  if (!ready) return;
-
-  String line;
-  line.reserve(len);
-  for (uint16_t i = 0; i < len; ++i) line += (char)rxBuffer[i];
-  handleFrame(line);
+  if (ready) {
+    handleFrame(rxBuffer, len);
+  }
 }
 
 inline void rxPushBit(uint8_t bit) {
@@ -195,27 +172,18 @@ inline void rxPushBit(uint8_t bit) {
   ++rxBitCount;
   if (rxBitCount < 8) return;
   const uint8_t b = rxByte;
-  rxBitCount = 0;
-  rxByte = 0;
+  rxBitCount = 0; rxByte = 0;
 
   switch (rxState) {
     case ST_SEARCH_PREAMBLE:
-      if (b == SYNC_BYTE) {
-        rxState = ST_READ_LEN;
-        rxIdx = 0;
-        rxLen = 0;
-      }
+      if (b == SYNC_BYTE) { rxState = ST_READ_LEN; rxIdx = 0; rxLen = 0; }
       break;
     case ST_READ_LEN:
       if (rxIdx == 0) { rxLen = (uint16_t)b << 8; rxIdx = 1; }
       else {
         rxLen |= b;
-        if (rxLen == 0 || rxLen > MAX_PAYLOAD) {
-          rxState = ST_SEARCH_PREAMBLE;
-        } else {
-          rxState = ST_READ_PAYLOAD;
-          rxIdx = 0;
-        }
+        if (rxLen == 0 || rxLen > MAX_PAYLOAD) { rxState = ST_SEARCH_PREAMBLE; } 
+        else { rxState = ST_READ_PAYLOAD; rxIdx = 0; }
       }
       break;
     case ST_READ_PAYLOAD:
@@ -226,64 +194,46 @@ inline void rxPushBit(uint8_t bit) {
         rxState = ST_SEARCH_PREAMBLE;
       }
       break;
-    default: break;
   }
 }
 
-// Esta funcion reemplaza a la antigua ISR. Es llamada por la tarea de escaneo
-// cuando detectamos por software que la señal cruzó los umbrales.
 void processEdge(bool isHigh) {
   const unsigned long now = micros();
   const unsigned long dt  = now - manchLastEdgeUs;
   manchLastEdgeUs = now;
-
-  // nivel actual POST-flanco: HIGH significa flanco de subida = bit 0
   const uint8_t bit = isHigh ? 0 : 1;
 
   portENTER_CRITICAL(&rxMux);
-
   if (dt > MAN_TIMEOUT_US) {
     rxState = ST_SEARCH_PREAMBLE;
     rxByte = 0; rxBitCount = 0; rxIdx = 0;
     manchLastWasShort = false;
     rxPushBit(bit);
   } else if (manchLastWasShort) {
-    rxPushBit(bit);
-    manchLastWasShort = false;
+    rxPushBit(bit); manchLastWasShort = false;
   } else if (dt < MAN_SHORT_US) {
     manchLastWasShort = true;
   } else {
-    rxPushBit(bit);
-    manchLastWasShort = false;
+    rxPushBit(bit); manchLastWasShort = false;
   }
-
   portEXIT_CRITICAL(&rxMux);
 }
 
-// =========================================================================
-// TAREA DE LECTURA DEL ADC (Se ejecuta en paralelo al loop)
-// =========================================================================
 void adcPollingTask(void *pvParameters) {
-  bool lastState = false; // Asumimos que arranca apagado
-  
+  bool lastState = false; 
   while (true) {
     int val = analogRead(PIN_ADC_LDR);
     bool newState = lastState;
+    if (val > THRESHOLD_HIGH) newState = true;
+    else if (val < THRESHOLD_LOW) newState = false;
 
-    // Histéresis
-    if (val > THRESHOLD_HIGH) {
-      newState = true;
-    } else if (val < THRESHOLD_LOW) {
-      newState = false;
-    }
+    // Actualizamos la variable global para el LED del modo direccionamiento
+    laserDetected = newState;
 
-    // Si hubo un cambio de estado, procesamos el flanco
     if (newState != lastState) {
       processEdge(newState);
       lastState = newState;
     }
-
-    // Pausa pequeñita para no bloquear el procesador (1 milisegundo), Es lo suficientemente rápido para no perder resolución en los 25ms de Manchester
     vTaskDelay(pdMS_TO_TICKS(1)); 
   }
 }
@@ -301,7 +251,7 @@ String stateJson() {
   last["Err_El"] = lastData.errEl;
   last["Mot_Az"] = lastData.motAz;
   last["Mot_El"] = lastData.motEl;
-  last["Estado"] = lastData.estado;
+  last["Estado"] = lastEstado;
   last["v_dc"] = lastData.vdc;
   last["i_dc"] = lastData.idc;
   last["p_w"] = lastData.pw;
@@ -310,7 +260,6 @@ String stateJson() {
   metrics["rx_ok"] = rxOk;
   metrics["crc_err"] = crcErr;
   metrics["frame_err"] = frameErr;
-  metrics["json_err"] = jsonErr;
   metrics["seq_gap"] = seqGap;
   metrics["link_quality_pct"] = lastQuality;
 
@@ -327,6 +276,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <title>FSO RX Dashboard</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:16px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .card{background:#111827;border:1px solid #334155;border-radius:10px;padding:12px}
 .big{font-size:28px;font-weight:700}
@@ -335,10 +285,13 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;marg
 .badge{padding:2px 8px;border-radius:999px;background:#1f2937}
 .ok{color:#22c55e}.bad{color:#ef4444}
 .bar{height:12px;background:#1f2937;border-radius:6px;overflow:hidden}
-.fill{height:100%;background:linear-gradient(90deg,#ef4444,#f59e0b,#22c55e);width:0%}
+.fill{height:100%;background:linear-gradient(90deg,#ef4444,#f59e0b,#22c55e);width:0%;transition:width 0.3s}
 </style>
 </head><body>
-<h2>FSO Telemetria Solar (RX)</h2>
+<div class="header">
+  <h2 style="margin:0">FSO Telemetria Solar (RX)</h2>
+  <div class="small" style="text-align:right">Último dato:<br><b id="time" style="font-size:14px;color:#e2e8f0">--:--:--</b></div>
+</div>
 <div class="grid">
 <div class="card"><div class="small">Potencia</div><div class="big" id="p">--</div></div>
 <div class="card"><div class="small">Tension</div><div class="big" id="v">--</div></div>
@@ -357,11 +310,19 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;marg
 <div class="row"><span id="q">0%</span><span>OK:<b id="ok">0</b></span><span>CRC:<b id="crc">0</b></span><span>FRAME:<b id="fr">0</b></span><span>GAP:<b id="gp">0</b></span></div>
 </div>
 <script>
+let localSeq = -1;
 async function tick(){
   try{
     const r=await fetch('/api/state',{cache:'no-store'});
     const s=await r.json();
     const d=s.last||{},m=s.metrics||{};
+    
+    if(d.seq !== undefined && d.seq !== localSeq) {
+      localSeq = d.seq;
+      const now = new Date();
+      document.getElementById('time').textContent = now.toLocaleTimeString('es-AR');
+    }
+
     document.getElementById('p').textContent=(d.p_w??0).toFixed?d.p_w.toFixed(2)+' W':d.p_w+' W';
     document.getElementById('v').textContent=(d.v_dc??0).toFixed?d.v_dc.toFixed(2)+' V':d.v_dc+' V';
     document.getElementById('i').textContent=(d.i_dc??0).toFixed?d.i_dc.toFixed(2)+' A':d.i_dc+' A';
@@ -374,7 +335,7 @@ async function tick(){
     document.getElementById('qf').style.width=q+'%';
     document.getElementById('ok').textContent=m.rx_ok??0;
     document.getElementById('crc').textContent=m.crc_err??0;
-    document.getElementById('fr').textContent=(m.frame_err??0)+(m.json_err??0);
+    document.getElementById('fr').textContent=m.frame_err??0;
     document.getElementById('gp').textContent=m.seq_gap??0;
   }catch(e){}
 }
@@ -383,67 +344,85 @@ setInterval(tick,1000); tick();
 </body></html>
 )HTML";
 
-void handleRoot() {
-  server.send(200, "text/html; charset=utf-8", INDEX_HTML);
-}
-
-void handleApiState() {
-  server.send(200, "application/json; charset=utf-8", stateJson());
-}
+void handleRoot() { server.send(200, "text/html; charset=utf-8", INDEX_HTML); }
+void handleApiState() { server.send(200, "application/json; charset=utf-8", stateJson()); }
 
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("[RX] ESP32 FSO RX iniciado (Decodificador por ADC)");
+  Serial.println("[RX] ESP32 FSO RX iniciado (Decodificador ADC Binario)");
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
-  Serial.printf("[RX] ADC LDR en GPIO%d\n", PIN_ADC_LDR);
 
-  pinMode(PIN_LED_R, OUTPUT);
-  pinMode(PIN_LED_G, OUTPUT);
-  pinMode(PIN_LED_B, OUTPUT);
+  // Configuramos el botón
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  pinMode(PIN_LED_R, OUTPUT); pinMode(PIN_LED_G, OUTPUT); pinMode(PIN_LED_B, OUTPUT);
   setLed(true, false, false);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-  const bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.printf("[RX] AP %s ssid=%s ip=%s\n", apOk ? "OK" : "FAIL", AP_SSID,
-                WiFi.softAPIP().toString().c_str());
+  WiFi.softAP(AP_SSID, AP_PASS);
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/state", HTTP_GET, handleApiState);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
-  Serial.println("[RX] Dashboard en http://192.168.4.1/");
-
-  // Lanzamos la tarea dedicada de escaneo del ADC en el Core 1
   manchLastEdgeUs = micros();
-  xTaskCreatePinnedToCore(
-    adcPollingTask,   // Funcion de la tarea
-    "ADC_Task",       // Nombre
-    4096,             // Tamaño de pila (stack)
-    NULL,             // Parametros
-    2,                // Prioridad (alta)
-    NULL,             // Handle
-    1                 // Anclada al Core 1
-  );
-  Serial.println("[RX] Tarea de digitalizacion y Manchester activa!");
+  xTaskCreatePinnedToCore(adcPollingTask, "ADC_Task", 4096, NULL, 2, NULL, 1);
 }
 
 void loop() {
+  // 1. Lógica del botón de Modo Direccionamiento RX
+  int reading = digitalRead(PIN_BUTTON);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    static int buttonState = HIGH;
+    if (reading != buttonState) {
+      buttonState = reading;
+      
+      if (buttonState == LOW) {
+        targetingModeRx = !targetingModeRx;
+        
+        if (targetingModeRx) {
+          Serial.println("\n[RX] >>> MODO DIRECCIONAMIENTO ACTIVADO <<< (Esperando haz...)");
+        } else {
+          Serial.println("\n[RX] <<< MODO NORMAL ACTIVADO >>> (Decodificando)");
+        }
+      }
+    }
+  }
+  lastButtonState = reading;
+
+  // 2. Control del LED
+  if (targetingModeRx) {
+    // Modo Direccionamiento: Azul si el láser incide, apagado si no.
+    if (laserDetected) {
+      setLed(false, false, true); // Azul
+    } else {
+      setLed(false, false, false); // Apagado
+    }
+  } else {
+    // Modo Normal: Manejo de estado por conexión (Rojo/Verde/Amarillo)
+    updateLed();
+  }
+
+  // 3. Procesamiento normal de tramas y red
   readUartFrames();
   updateQuality();
-  updateLed();          
   server.handleClient();
 
   static unsigned long tLog = 0;
   if (millis() - tLog > 5000) {
     tLog = millis();
-    Serial.printf("[RX][LINK] ok=%lu crc=%lu frame=%lu json=%lu gap=%lu q=%d%%\n",
-                  rxOk, crcErr, frameErr, jsonErr, seqGap, lastQuality);
+    Serial.printf("[RX][LINK] ok=%lu crc=%lu frame=%lu gap=%lu q=%d%%\n",
+                  rxOk, crcErr, frameErr, seqGap, lastQuality);
   }
 }
