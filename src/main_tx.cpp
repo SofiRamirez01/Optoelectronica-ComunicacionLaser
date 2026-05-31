@@ -5,7 +5,7 @@ namespace {
 
 constexpr int PIN_TX2 = 17;
 constexpr int PIN_RX2 = 16;
-// Pin donde conectaremos el pulsador (el otro extremo a GND)
+// pulsador para settear en modo direccionamiento:
 constexpr int PIN_BUTTON = 4;
 
 // Manchester a 20 bps => 1 bit = 50 ms, medio bit = 25 ms

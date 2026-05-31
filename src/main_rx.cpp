@@ -283,8 +283,7 @@ void adcPollingTask(void *pvParameters) {
       lastState = newState;
     }
 
-    // Pausa pequeñita para no bloquear el procesador (1 milisegundo)
-    // Es lo suficientemente rápido para no perder resolución en los 25ms de Manchester
+    // Pausa pequeñita para no bloquear el procesador (1 milisegundo), Es lo suficientemente rápido para no perder resolución en los 25ms de Manchester
     vTaskDelay(pdMS_TO_TICKS(1)); 
   }
 }
@@ -436,7 +435,6 @@ void setup() {
 }
 
 void loop() {
-  // El loop original se mantiene super limpio.
   readUartFrames();
   updateQuality();
   updateLed();          
